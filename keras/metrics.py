@@ -1354,7 +1354,186 @@ class SpecificityAtSensitivity(SensitivitySpecificityBase):
         return dict(list(base_config.items()) + list(config.items()))
 
 
-class Precision(Metric):
+class BinaryScoreKeeper:
+    PRECISION = 'precision'
+    RECALL = 'recall'
+    F1 = 'f1'
+
+    def __init__(self):
+        self.true_positives = None
+        self.false_positives = None
+        self.false_negatives = None
+        self._precision = None
+        self._recall = None
+        self._f1 = None
+
+    def precision(self):
+        denom = (self.true_positives + self.false_positives)
+        return K.switch(
+            K.greater(denom, 0),
+            self.true_positives / denom,
+            K.zeros_like(self.true_positives))
+
+    def recall(self):
+        denom = (self.true_positives + self.false_negatives)
+        return K.switch(
+            K.greater(denom, 0),
+            self.true_positives / denom,
+            K.zeros_like(self.true_positives))
+
+    def f1(self):
+        precision = self.precision()
+        recall = self.recall()
+        return K.switch(
+                K.greater(precision + recall, 0),
+                2 * precision * recall / (precision + recall),
+                K.zeros_like(self.true_positives))
+
+    def spawn_scores(self, scores, **kwargs):
+        metrics = []
+        update_required = True
+        if self.PRECISION in scores:
+            metrics.append(Precision(
+                update_required=update_required,
+                binary_scorekeeper=self, **kwargs))
+            update_required = False
+        if self.RECALL in scores:
+            metrics.append(Recall(
+                update_required=update_required,
+                binary_scorekeeper=self, **kwargs))
+            update_required = False
+        if self.F1 in scores:
+            metrics.append(F1Score(
+                update_required=update_required,
+                binary_scorekeeper=self, **kwargs))
+            update_required = False
+        return metrics
+
+    def variables_to_update(self):
+        variables_to_update = {}
+        if self.true_positives is not None:
+            variables_to_update[metrics_utils.ConfusionMatrix.TRUE_POSITIVES] = self.true_positives
+        if self.false_positives is not None:
+            variables_to_update[metrics_utils.ConfusionMatrix.FALSE_POSITIVES] = self.false_positives
+        if self.false_negatives is not None:
+            variables_to_update[metrics_utils.ConfusionMatrix.FALSE_NEGATIVES] = self.false_negatives
+        return variables_to_update
+
+
+class BinaryScore(Metric):
+    def __init__(self,
+                 thresholds=None,
+                 top_k=None,
+                 class_id=None,
+                 name=None,
+                 dtype=None,
+                 update_required=True,
+                 binary_scorekeeper=None):
+        super(BinaryScore, self).__init__(name=name, dtype=dtype)
+        self.init_thresholds = thresholds
+        if top_k is not None and K.backend() != 'tensorflow':
+            raise RuntimeError(
+                '`top_k` argument for `Recall` metric is currently supported only '
+                'with TensorFlow backend.')
+        self.top_k = top_k
+        self.class_id = class_id
+
+        default_threshold = 0.5 if top_k is None else metrics_utils.NEG_INF
+        self.thresholds = metrics_utils.parse_init_thresholds(
+            thresholds, default_threshold=default_threshold)
+
+        self._true_positives = None
+        self._false_positives = None
+        self._false_negatives = None
+
+        if binary_scorekeeper is None:
+            binary_scorekeeper = BinaryScoreKeeper()
+        self.binary_scorekeeper = binary_scorekeeper
+        self.update_required = update_required
+        self.define_weights()
+
+    def define_weights(self):
+        self.true_positives
+        self.false_negatives
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        if not self.update_required:
+            return []
+        variables_to_update = self.binary_scorekeeper.variables_to_update()
+
+        return metrics_utils.update_confusion_matrix_variables(
+            variables_to_update,
+            y_true,
+            y_pred,
+            thresholds=self.thresholds,
+            top_k=self.top_k,
+            class_id=self.class_id,
+            sample_weight=sample_weight)
+
+    @property
+    def true_positives(self):
+        if self._true_positives is None:
+            self._true_positives = self.binary_scorekeeper.true_positives = self.add_weight(
+                'true_positives',
+                shape=(len(self.thresholds),),
+                initializer='zeros')
+        return self._true_positives
+
+    @true_positives.setter
+    def true_positives(self, value):
+        self._true_positives = self.binary_scorekeeper.true_positives = self.binary_scorekeeper.true_positives
+
+    @property
+    def false_negatives(self):
+        if self._false_negatives is None:
+            self._false_negatives = self.binary_scorekeeper.false_negatives = self.add_weight(
+                'false_negatives',
+                shape=(len(self.thresholds),),
+                initializer='zeros')
+        return self._false_negatives
+
+    @false_negatives.setter
+    def false_negatives(self, value):
+        self._false_negatives = self.binary_scorekeeper.false_negatives = value
+
+    @property
+    def false_positives(self):
+        if self._false_positives is None:
+            self._false_positives = self.binary_scorekeeper.false_positives = self.add_weight(
+                'false_positives',
+                shape=(len(self.thresholds),),
+                initializer='zeros')
+        return self._false_positives
+
+    @false_positives.setter
+    def false_positives(self, value):
+        self._false_positives = self.binary_scorekeeper.false_positives = value
+
+    def result(self):
+        """Computes and returns the metric value tensor.
+
+        Result computation is an idempotent operation that simply calculates the
+        metric value using the state variables.
+        """
+        raise NotImplementedError('Must be implemented in subclasses.')
+
+    def reset_states(self):
+        if self.update_required:
+            num_thresholds = len(metrics_utils.to_list(self.thresholds))
+            K.batch_set_value(
+                [(v, np.zeros((num_thresholds,))) for v in self.weights])
+
+    def get_config(self):
+        config = {
+            'thresholds': self.init_thresholds,
+            'top_k': self.top_k,
+            'class_id': self.class_id
+        }
+        base_config = super(BinaryScore, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+class Precision(BinaryScore):
     """Computes the precision of the predictions with respect to the labels.
 
     For example, if `y_true` is [0, 1, 1, 1] and `y_pred` is [1, 0, 1, 1]
@@ -1401,71 +1580,28 @@ class Precision(Metric):
     """
 
     def __init__(self,
-                 thresholds=None,
-                 top_k=None,
-                 class_id=None,
-                 name=None,
-                 dtype=None):
-        super(Precision, self).__init__(name=name, dtype=dtype)
-        self.init_thresholds = thresholds
-        if top_k is not None and K.backend() != 'tensorflow':
-            raise RuntimeError(
-                '`top_k` argument for `Precision` metric is currently supported '
-                'only with TensorFlow backend.')
+                thresholds=None,
+                top_k=None,
+                class_id=None,
+                name=None,
+                dtype=None,
+                binary_scorekeeper=None,
+                update_required=True):
+        super(Precision, self).__init__(
+            name=name, dtype=dtype, thresholds=thresholds,
+            top_k=top_k, class_id=class_id, binary_scorekeeper=binary_scorekeeper,
+            update_required=update_required)
 
-        self.top_k = top_k
-        self.class_id = class_id
-
-        default_threshold = 0.5 if top_k is None else metrics_utils.NEG_INF
-        self.thresholds = metrics_utils.parse_init_thresholds(
-            thresholds, default_threshold=default_threshold)
-        self.true_positives = self.add_weight(
-            'true_positives',
-            shape=(len(self.thresholds),),
-            initializer='zeros')
-        self.false_positives = self.add_weight(
-            'false_positives',
-            shape=(len(self.thresholds),),
-            initializer='zeros')
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        return metrics_utils.update_confusion_matrix_variables(
-            {
-                metrics_utils.ConfusionMatrix.TRUE_POSITIVES: self.true_positives,
-                metrics_utils.ConfusionMatrix.FALSE_POSITIVES: self.false_positives
-            },
-            y_true,
-            y_pred,
-            thresholds=self.thresholds,
-            top_k=self.top_k,
-            class_id=self.class_id,
-            sample_weight=sample_weight)
+    def define_weights(self):
+        self.true_positives
+        self.false_positives
 
     def result(self):
-        denom = (self.true_positives + self.false_positives)
-        result = K.switch(
-            K.greater(denom, 0),
-            self.true_positives / denom,
-            K.zeros_like(self.true_positives))
-
-        return result[0] if len(self.thresholds) == 1 else result
-
-    def reset_states(self):
-        num_thresholds = len(metrics_utils.to_list(self.thresholds))
-        K.batch_set_value(
-            [(v, np.zeros((num_thresholds,))) for v in self.weights])
-
-    def get_config(self):
-        config = {
-            'thresholds': self.init_thresholds,
-            'top_k': self.top_k,
-            'class_id': self.class_id
-        }
-        base_config = super(Precision, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+        precision = self.binary_scorekeeper.precision()
+        return precision[0] if len(self.thresholds) == 1 else precision
 
 
-class Recall(Metric):
+class Recall(BinaryScore):
     """Computes the recall of the predictions with respect to the labels.
 
     For example, if `y_true` is [0, 1, 1, 1] and `y_pred` is [1, 0, 1, 1]
@@ -1515,63 +1651,46 @@ class Recall(Metric):
                  top_k=None,
                  class_id=None,
                  name=None,
-                 dtype=None):
-        super(Recall, self).__init__(name=name, dtype=dtype)
-        self.init_thresholds = thresholds
-        if top_k is not None and K.backend() != 'tensorflow':
-            raise RuntimeError(
-                '`top_k` argument for `Recall` metric is currently supported only '
-                'with TensorFlow backend.')
+                 dtype=None,
+                 binary_scorekeeper=None,
+                 update_required=True):
+        super(Recall, self).__init__(
+            name=name, dtype=dtype, thresholds=thresholds,
+            top_k=top_k, class_id=class_id, binary_scorekeeper=binary_scorekeeper,
+            update_required=update_required)
 
-        self.top_k = top_k
-        self.class_id = class_id
-
-        default_threshold = 0.5 if top_k is None else metrics_utils.NEG_INF
-        self.thresholds = metrics_utils.parse_init_thresholds(
-            thresholds, default_threshold=default_threshold)
-        self.true_positives = self.add_weight(
-            'true_positives',
-            shape=(len(self.thresholds),),
-            initializer='zeros')
-        self.false_negatives = self.add_weight(
-            'false_negatives',
-            shape=(len(self.thresholds),),
-            initializer='zeros')
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        return metrics_utils.update_confusion_matrix_variables(
-            {
-                metrics_utils.ConfusionMatrix.TRUE_POSITIVES: self.true_positives,
-                metrics_utils.ConfusionMatrix.FALSE_NEGATIVES: self.false_negatives
-            },
-            y_true,
-            y_pred,
-            thresholds=self.thresholds,
-            top_k=self.top_k,
-            class_id=self.class_id,
-            sample_weight=sample_weight)
+    def define_weights(self):
+        self.true_positives
+        self.false_negatives
 
     def result(self):
-        denom = (self.true_positives + self.false_negatives)
-        result = K.switch(
-            K.greater(denom, 0),
-            self.true_positives / denom,
-            K.zeros_like(self.true_positives))
-        return result[0] if len(self.thresholds) == 1 else result
+        recall = self.binary_scorekeeper.recall()
+        return recall[0] if len(self.thresholds) == 1 else recall
 
-    def reset_states(self):
-        num_thresholds = len(metrics_utils.to_list(self.thresholds))
-        K.batch_set_value(
-            [(v, np.zeros((num_thresholds,))) for v in self.weights])
 
-    def get_config(self):
-        config = {
-            'thresholds': self.init_thresholds,
-            'top_k': self.top_k,
-            'class_id': self.class_id
-        }
-        base_config = super(Recall, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+class F1Score(BinaryScore):
+
+    def __init__(self,
+                 thresholds=None,
+                 top_k=None,
+                 class_id=None,
+                 name=None,
+                 dtype=None,
+                 binary_scorekeeper=None,
+                 update_required=True):
+        super(F1Score, self).__init__(
+            name=name, dtype=dtype, thresholds=thresholds,
+            top_k=top_k, class_id=class_id, binary_scorekeeper=binary_scorekeeper,
+            update_required=update_required)
+
+    def define_weights(self):
+        self.true_positives
+        self.false_positives
+        self.false_negatives
+
+    def result(self):
+        f1 = self.binary_scorekeeper.f1()
+        return f1[0] if len(self.thresholds) == 1 else f1
 
 
 class AUC(Metric):

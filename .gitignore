@@ -3,6 +3,7 @@
 *.swp
 temp/*
 dist/*
+env/*
 build/*
 keras/datasets/data/*
 keras/datasets/temp/*
@@ -22,3 +23,5 @@ examples/img/*
 # developer environments
 .idea
 .vscode
+
+ .ipynb_checkpoints/
