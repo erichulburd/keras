@@ -892,6 +892,190 @@ class TestRecall(object):
         assert np.isclose(3, K.eval(r_obj.false_negatives))
 
 
+class TestF1Score(object):
+
+    def test_config(self):
+        f1_obj = metrics.F1Score(
+            name='my_f1', thresholds=[0.4, 0.9], top_k=15, class_id=12)
+        assert f1_obj.name == 'my_f1'
+        assert len(f1_obj.weights) == 3
+        assert ([v.name for v in f1_obj.weights] ==
+                ['true_positives:0', 'false_negatives:0', 'false_positives:0'])
+        assert f1_obj.thresholds == [0.4, 0.9]
+        assert f1_obj.top_k == 15
+        assert f1_obj.class_id == 12
+
+        # Check save and restore config
+        f1_obj2 = metrics.F1Score.from_config(f1_obj.get_config())
+        assert f1_obj2.name == 'my_f1'
+        assert len(f1_obj2.weights) == 3
+        assert f1_obj2.thresholds == [0.4, 0.9]
+        assert f1_obj2.top_k == 15
+        assert f1_obj2.class_id == 12
+
+    def test_unweighted(self):
+        f1_obj = metrics.F1Score()
+        y_pred = K.constant([1, 0, 1, 0], shape=(1, 4))
+        y_true = K.constant([0, 1, 1, 0], shape=(1, 4))
+        result = f1_obj(y_true, y_pred)
+        recall = 0.5
+        precision = 0.5
+        assert np.isclose(2 * recall * precision / (recall + precision), K.eval(result))
+
+    def test_unweighted_all_incorrect(self):
+        f1_obj = metrics.F1Score(thresholds=[0.5])
+        inputs = np.random.randint(0, 2, size=(100, 1))
+        y_pred = K.constant(inputs)
+        y_true = K.constant(1 - inputs)
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(0, K.eval(result))
+
+    def test_weighted(self):
+        f1_obj = metrics.F1Score()
+        y_pred = K.constant([[1, 0, 1, 0], [0, 1, 0, 1]])
+        y_true = K.constant([[0, 1, 1, 0], [1, 0, 0, 1]])
+        result = f1_obj(
+            y_true,
+            y_pred,
+            sample_weight=K.constant([[1, 2, 3, 4], [4, 3, 2, 1]]))
+        weighted_true_positives = 3.0 + 1.0
+        weighted_true = (2.0 + 3.0) + (4.0 + 1.0)
+        expected_recall = weighted_true_positives / weighted_true
+
+        weighted_pred = (1.0 + 3.0) + (3.0 + 1.0)
+        expected_precision = weighted_true_positives / weighted_pred
+
+        f1 = 2 * expected_precision * expected_recall / (expected_precision + expected_recall)
+        assert np.isclose(f1, K.eval(result))
+
+    def test_unweighted_with_threshold(self):
+        f1_obj = metrics.F1Score(thresholds=[0.5, 0.7])
+        y_pred = K.constant([1, 0, 0.6, 0], shape=(1, 4))
+        y_true = K.constant([0, 1, 1, 0], shape=(1, 4))
+        result = f1_obj(y_true, y_pred)
+        assert np.allclose([0.5, 0.], K.eval(result), 0)
+
+    def test_weighted_with_threshold(self):
+        f1_obj = metrics.F1Score(thresholds=[0.5, 1.])
+        y_true = K.constant([[0, 1], [1, 0]], shape=(2, 2))
+        y_pred = K.constant([[1, 0], [0.6, 0]],
+                            shape=(2, 2),
+                            dtype='float32')
+        weights = K.constant([[1, 4], [3, 2]],
+                             shape=(2, 2),
+                             dtype='float32')
+        result = f1_obj(y_true, y_pred, sample_weight=weights)
+        weighted_tp = 0 + 3.
+        weighted_true = (0 + 3.) + (4. + 0.)
+        expected_recall = weighted_tp / weighted_true
+
+        weighted_pred = 1. + 3.
+        expected_precision = weighted_tp / weighted_pred
+        f1 = 2 * expected_precision * expected_recall / (expected_precision + expected_recall)
+        assert np.allclose([f1, 0], K.eval(result), 1e-3)
+
+    def test_unweighted_top_k(self):
+        f1_obj = metrics.F1Score(top_k=3)
+        y_pred = K.constant([0.2, 0.1, 0.5, 0, 0.2], shape=(1, 5))
+        y_true = K.constant([0, 1, 1, 0, 0], shape=(1, 5))
+        expected_recall = 0.5
+        expected_precision = 1 / 3.
+        f1 = 2 * expected_recall * expected_precision / (expected_recall + expected_precision)
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(f1, K.eval(result))
+
+    def test_weighted_top_k(self):
+        f1_obj = metrics.F1Score(top_k=3)
+        y_pred1 = K.constant([0.2, 0.1, 0.4, 0, 0.2], shape=(1, 5))
+        y_true1 = K.constant([0, 1, 1, 0, 1], shape=(1, 5))
+        K.eval(
+            f1_obj(
+                y_true1,
+                y_pred1,
+                sample_weight=K.constant([[1, 4, 2, 3, 5]])))
+
+        y_pred2 = K.constant([0.2, 0.6, 0.4, 0.2, 0.2], shape=(1, 5))
+        y_true2 = K.constant([1, 0, 1, 1, 1], shape=(1, 5))
+        result = f1_obj(y_true2, y_pred2, sample_weight=K.constant(3))
+
+        tp = (2 + 5) + (3 + 3)
+        positives = (4 + 2 + 5) + (3 + 3 + 3 + 3)
+        expected_recall = float(tp) / positives
+        pred_positives = (1 + 2 + 5) + (3 + 3 + 3)
+        expected_precision = float(tp) / pred_positives
+        expected_f1 = 2 * expected_recall * expected_precision / (expected_recall + expected_precision)
+        assert np.isclose(expected_f1, K.eval(result))
+
+    def test_unweighted_class_id(self):
+        f1_obj = metrics.F1Score(class_id=2)
+
+        y_pred = K.constant([0.2, 0.1, 0.6, 0, 0.2], shape=(1, 5))
+        y_true = K.constant([0, 1, 1, 0, 0], shape=(1, 5))
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(1, K.eval(result))
+        assert np.isclose(1, K.eval(f1_obj.true_positives))
+        assert np.isclose(0, K.eval(f1_obj.false_negatives))
+        assert np.isclose(0, K.eval(f1_obj.false_positives))
+
+        y_pred = K.constant([0.2, 0.1, 0, 0, 0.2], shape=(1, 5))
+        y_true = K.constant([0, 1, 1, 0, 0], shape=(1, 5))
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(2 / 3., K.eval(result))
+        assert np.isclose(1, K.eval(f1_obj.true_positives))
+        assert np.isclose(1, K.eval(f1_obj.false_negatives))
+        assert np.isclose(0, K.eval(f1_obj.false_positives))
+
+        y_pred = K.constant([0.2, 0.1, 0.6, 0, 0.2], shape=(1, 5))
+        y_true = K.constant([0, 1, 0, 0, 0], shape=(1, 5))
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(1 / 2., K.eval(result))
+        assert np.isclose(1, K.eval(f1_obj.true_positives))
+        assert np.isclose(1, K.eval(f1_obj.false_negatives))
+        assert np.isclose(1, K.eval(f1_obj.false_positives))
+
+    def test_unweighted_top_k_and_class_id(self):
+        f1_obj = metrics.F1Score(class_id=2, top_k=2)
+
+        y_pred = K.constant([0.2, 0.6, 0.3, 0, 0.2], shape=(1, 5))
+        y_true = K.constant([0, 1, 1, 0, 0], shape=(1, 5))
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(1, K.eval(result))
+        assert np.isclose(1, K.eval(f1_obj.true_positives))
+        assert np.isclose(0, K.eval(f1_obj.false_negatives))
+        assert np.isclose(0, K.eval(f1_obj.false_positives))
+
+        y_pred = K.constant([1, 1, 0.9, 1, 1], shape=(1, 5))
+        y_true = K.constant([0, 1, 1, 0, 0], shape=(1, 5))
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(2 / 3., K.eval(result))
+        assert np.isclose(1, K.eval(f1_obj.true_positives))
+        assert np.isclose(1, K.eval(f1_obj.false_negatives))
+        assert np.isclose(0, K.eval(f1_obj.false_positives))
+
+        y_pred = K.constant([0.2, 0.6, 0.3, 0, 0.2], shape=(1, 5))
+        y_true = K.constant([0, 1, 0, 1, 0], shape=(1, 5))
+        result = f1_obj(y_true, y_pred)
+        assert np.isclose(0.5, K.eval(result))
+        assert np.isclose(1, K.eval(f1_obj.true_positives))
+        assert np.isclose(1, K.eval(f1_obj.false_negatives))
+        assert np.isclose(1, K.eval(f1_obj.false_positives))
+
+    def test_unweighted_top_k_and_threshold(self):
+        f1_obj = metrics.F1Score(thresholds=.7, top_k=2)
+
+        y_pred = K.constant([0.2, 0.8, 0.6, 0.71, 0, 0.2], shape=(1, 6))
+        y_true = K.constant([1, 1, 1, 0, 0, 1], shape=(1, 6))
+        recall = 2. / (2 + 6)
+        precision = 2. / (2 + 2)
+        f1 = 2 * recall * precision / (recall + precision)
+        result = f1_obj(y_true, y_pred)
+        K.eval(result)
+        assert np.isclose(f1, K.eval(result))
+        assert np.isclose(2, K.eval(f1_obj.true_positives))
+        assert np.isclose(6, K.eval(f1_obj.false_negatives))
+        assert np.isclose(2, K.eval(f1_obj.false_positives))
+
+
 @pytest.mark.skipif(not tf.__version__.startswith('2.'),
                     reason='Requires TF 2')
 class TestMeanIoU(object):

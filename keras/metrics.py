@@ -1574,6 +1574,134 @@ class Recall(Metric):
         return dict(list(base_config.items()) + list(config.items()))
 
 
+class F1Score(Metric):
+    """Computes the F1 score of the predictions with respect to the labels.
+
+    For example, if `y_true` is [0, 1, 1, 1] and `y_pred` is [1, 0, 1, 1]
+    then the recall value is 2/(2+1), the precision is 2/(2+1). so F1 is
+    2 * (2/3) * (2/3) / (2/3 + 2/3) = 2/3.
+    If the weights were specified as [0, 0, 1, 0] then the F1 value would be 1.
+
+    This metric creates three local variables, `true_positives`, `false_positives`
+    and `false_negatives`, that are used to compute the recall, precision, and F1.
+    This value is ultimately returned as `F1`, an idempotent operation that calculates
+    F1 based on precision and recall.
+
+    If `sample_weight` is `None`, weights default to 1.
+    Use `sample_weight` of 0 to mask values.
+
+    If `top_k` is set, recall will be computed as how often on average a class
+    among the labels of a batch entry is in the top-k predictions.
+
+    If `class_id` is specified, we calculate recall by considering only the
+    entries in the batch for which `class_id` is in the label, and computing the
+    fraction of them for which `class_id` is above the threshold and/or in the
+    top-k predictions.
+
+    Usage with the compile API:
+    ```python
+    model = keras.Model(inputs, outputs)
+    model.compile('sgd', loss='mse', metrics=[keras.metrics.F1Score()])
+    ```
+
+    # Arguments
+        thresholds: (Optional) A float value or a python list/tuple of float
+            threshold values in [0, 1]. A threshold is compared with prediction
+            values to determine the truth value of predictions (i.e., above the
+            threshold is `true`, below is `false`). One metric value is generated
+            for each threshold value. If neither thresholds nor top_k are set, the
+            default is to calculate recall with `thresholds=0.5`.
+        top_k: (Optional) Unset by default. An int value specifying the top-k
+            predictions to consider when calculating recall.
+        class_id: (Optional) Integer class ID for which we want binary metrics.
+            This must be in the half-open interval `[0, num_classes)`, where
+            `num_classes` is the last dimension of predictions.
+        name: (Optional) string name of the metric instance.
+        dtype: (Optional) data type of the metric result.
+    """
+
+    def __init__(self,
+                 thresholds=None,
+                 top_k=None,
+                 class_id=None,
+                 name=None,
+                 dtype=None):
+        super(F1Score, self).__init__(name=name, dtype=dtype)
+        self.init_thresholds = thresholds
+        if top_k is not None and K.backend() != 'tensorflow':
+            raise RuntimeError(
+                '`top_k` argument for `Recall` metric is currently supported only '
+                'with TensorFlow backend.')
+
+        self.top_k = top_k
+        self.class_id = class_id
+
+        default_threshold = 0.5 if top_k is None else metrics_utils.NEG_INF
+        self.thresholds = metrics_utils.parse_init_thresholds(
+            thresholds, default_threshold=default_threshold)
+        self.true_positives = self.add_weight(
+            'true_positives',
+            shape=(len(self.thresholds),),
+            initializer='zeros')
+        self.false_negatives = self.add_weight(
+            'false_negatives',
+            shape=(len(self.thresholds),),
+            initializer='zeros')
+        self.false_positives = self.add_weight(
+            'false_positives',
+            shape=(len(self.thresholds),),
+            initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        return metrics_utils.update_confusion_matrix_variables(
+            {
+                metrics_utils.ConfusionMatrix.TRUE_POSITIVES: self.true_positives,
+                metrics_utils.ConfusionMatrix.FALSE_NEGATIVES: self.false_negatives,
+                metrics_utils.ConfusionMatrix.FALSE_POSITIVES: self.false_positives
+            },
+            y_true,
+            y_pred,
+            thresholds=self.thresholds,
+            top_k=self.top_k,
+            class_id=self.class_id,
+            sample_weight=sample_weight)
+
+    def result(self):
+        denom_recall = (self.true_positives + self.false_negatives)
+        recall = K.switch(
+            K.greater(denom_recall, 0),
+            self.true_positives / denom_recall,
+            K.zeros_like(self.true_positives))
+
+        denom_precision = (self.true_positives + self.false_positives)
+        precision = K.switch(
+            K.greater(denom_precision, 0),
+            self.true_positives / denom_precision,
+            K.zeros_like(self.true_positives))
+
+        denom_f1 = recall + precision
+        result = K.switch(
+            K.greater(denom_f1, 0),
+            (2 * recall * precision) / denom_f1,
+            K.zeros_like(self.true_positives))
+
+        return result[0] if len(self.thresholds) == 1 else result
+
+    def reset_states(self):
+        num_thresholds = len(metrics_utils.to_list(self.thresholds))
+        K.batch_set_value(
+            [(v, np.zeros((num_thresholds,))) for v in self.weights])
+
+    def get_config(self):
+        config = {
+            'thresholds': self.init_thresholds,
+            'top_k': self.top_k,
+            'class_id': self.class_id
+        }
+        base_config = super(F1Score, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
 class AUC(Metric):
     """Computes the approximate AUC (Area under the curve) via a Riemann sum.
 
